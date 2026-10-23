@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battery Drainer</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+    font-family: system-ui, sans-serif; overflow: hidden; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; z-index: 10;
+    pointer-events: none; }
+  .card { pointer-events: auto; background: rgba(18,18,20,.82);
+    border: 1px solid #333; border-radius: 14px; padding: 20px 24px;
+    backdrop-filter: blur(4px); width: min(92vw, 400px); text-align: center; }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; }
+  p { margin: 6px 0; font-size: .82rem; color: #aaa; }
+  button { pointer-events: auto; font-size: 1.05rem; font-weight: 600;
+    padding: 14px 24px; border: 0; border-radius: 10px; cursor: pointer;
+    width: 100%; margin-top: 10px; }
+  #toggle { background: #e5484d; color: #fff; }
+  #toggle.running { background: #30a46c; }
+  label { display: block; text-align: left; font-size: .8rem; margin: 12px 0 4px; }
+  input[type=range] { width: 100%; }
+  #chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 12px; }
+  .chip { font-size: .7rem; padding: 4px 9px; border-radius: 999px;
+    background: #222; color: #777; border: 1px solid #333; }
+  .chip.on { background: #163b2b; color: #7ee2b0; border-color: #2b6; }
+  #stat { font-variant-numeric: tabular-nums; font-size: .78rem; color: #888; margin-top: 12px; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="ui">
+  <div class="card">
+    <h1>Battery Drainer</h1>
+    <p>Pins the CPU and GPU, keeps the screen awake, and lights up the Wi-Fi radio, speakers, camera, flashlight and GPS — everything a browser can turn on at once.</p>
+    <label>CPU load (workers): <span id="wLabel"></span></label>
+    <input id="workers" type="range" min="1" max="64" value="24">
+    <button id="toggle">Start draining</button>
+    <div id="chips">
+      <span class="chip" id="c-cpu">CPU</span>
+      <span class="chip" id="c-gpu">GPU</span>
+      <span class="chip" id="c-wake">screen</span>
+      <span class="chip" id="c-net">Wi-Fi</span>
+      <span class="chip" id="c-audio">audio</span>
+      <span class="chip" id="c-vibe">vibrate</span>
+      <span class="chip" id="c-cam">camera+torch</span>
+      <span class="chip" id="c-geo">GPS</span>
+      <span class="chip" id="c-mem">memory</span>
+    </div>
+    <div id="stat">idle</div>
+    <p style="margin-top:12px">Allow the camera and location prompts for the fastest drain, and turn screen brightness all the way up.</p>
+  </div>
+</div>
+
+<script>
+// ---------- CPU: worker that pins a core forever ----------
+const workerSrc = `
+  let d = new Float64Array(8192);
+  for (let i=0;i<d.length;i++) d[i]=Math.random();
+  function spin(){
+    for (let n=0;n<8e6;n++){
+      let x=d[n&8191];
+      x=Math.sqrt(x*x+Math.sin(x)*Math.cos(x)*Math.tan(x||0.1));
+      x=Math.log(Math.abs(x)+1)*Math.exp(x%1)+Math.atan(x)*Math.sinh(x%2);
+      d[n&8191]=x;
+    }
+    setTimeout(spin,0);
+  }
+  spin();
+`;
+const workerURL = URL.createObjectURL(new Blob([workerSrc], {type:'application/javascript'}));
+
+let workers = [], running = false, mode = 'idle', mtSink = 0;
+let wakeLock = null, rafId = 0, redrawId = 0, startTime = 0, startGl = 0;
+let actx = null, osc = null, camStream = null, camVideo = null, geoId = null;
+let memHog = [], memBytes = 0;
+
+const $ = id => document.getElementById(id);
+const toggle = $('toggle'), workersInput = $('workers'), wLabel = $('wLabel'), stat = $('stat');
+const chip = (id,on) => $(id).classList.toggle('on', !!on);
+
+const cores = navigator.hardwareConcurrency || 8;
+workersInput.value = Math.min(64, cores * 3);     // overshoot cores to saturate + add scheduling overhead
+wLabel.textContent = workersInput.value;
+workersInput.oninput = () => { wLabel.textContent = workersInput.value; };
+
+// ---------- GPU: supersampled, heavy per-pixel fractal ----------
+const canvas = $('gl');
+const gl = canvas.getContext('webgl', {powerPreference:'high-performance', antialias:false});
+let prog, uTime, uRes;
+
+function initGL(){
+  if (!gl) return;
+  const vs = `attribute vec2 p; void main(){ gl_Position=vec4(p,0.0,1.0); }`;
+  const fs = `
+    precision highp float;
+    uniform float t; uniform vec2 res;
+    void main(){
+      vec2 uv=(gl_FragCoord.xy/res-0.5)*3.0;
+      vec2 c=uv+vec2(sin(t*0.1),cos(t*0.13));
+      vec2 z=vec2(0.0); float it=0.0;
+      for(int i=0;i<500;i++){
+        z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c;
+        z+=0.02*vec2(sin(z.y*8.0+t),cos(z.x*8.0+t));
+        if(dot(z,z)>4.0) break;
+        it+=1.0;
+      }
+      float v=it/500.0;
+      gl_FragColor=vec4(0.5+0.5*sin(v*20.0+t),0.5+0.5*sin(v*17.0+t*1.3),0.5+0.5*cos(v*13.0+t),1.0);
+    }`;
+  const sh=(ty,s)=>{const o=gl.createShader(ty);gl.shaderSource(o,s);gl.compileShader(o);return o;};
+  prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,vs));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(prog); gl.useProgram(prog);
+  const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  const loc=gl.getAttribLocation(prog,'p');
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+  uTime=gl.getUniformLocation(prog,'t'); uRes=gl.getUniformLocation(prog,'res');
+}
+function resize(){
+  const dpr=window.devicePixelRatio||1;
+  let w=Math.floor(innerWidth*dpr*1.5), h=Math.floor(innerHeight*dpr*1.5);  // supersample 1.5x
+  const cap=9e6; // cap total pixels so a weak GPU doesn't crash (crashing would stop the drain)
+  if (w*h>cap){ const s=Math.sqrt(cap/(w*h)); w=Math.floor(w*s); h=Math.floor(h*s); }
+  canvas.width=w; canvas.height=h;
+  if (gl) gl.viewport(0,0,w,h);
+}
+addEventListener('resize', resize); resize(); initGL();
+
+function drawGL(now){
+  if (gl && prog){
+    gl.uniform1f(uTime,(now-startGl)/1000);
+    gl.uniform2f(uRes,canvas.width,canvas.height);
+    gl.drawArrays(gl.TRIANGLES,0,3);   // two draws per frame = extra GPU work
+    gl.drawArrays(gl.TRIANGLES,0,3);
+  }
+}
+function renderGL(now){ if(!running) return; drawGL(now); rafId=requestAnimationFrame(renderGL); }
+
+// ---------- screen wake lock ----------
+async function requestWake(){
+  try{ if('wakeLock' in navigator){ wakeLock=await navigator.wakeLock.request('screen'); chip('c-wake',1);} }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'&&running&&!wakeLock) requestWake(); });
+
+// ---------- CPU fallback on main thread (when workers are blocked) ----------
+function mtSpin(){
+  if(!running) return;
+  let x=Math.random();
+  for(let k=0;k<3e6;k++){ x=Math.sqrt(x*x+Math.sin(x)*Math.cos(x)); x=Math.log(Math.abs(x)+1)*Math.exp(x%1); }
+  mtSink=x; setTimeout(mtSpin,0);
+}
+
+// ---------- Wi-Fi radio: keep it awake with constant requests ----------
+function ping(){
+  if(!running) return;
+  const t=Date.now();
+  fetch('./?_='+t,{cache:'no-store'}).catch(()=>{});                                  // local
+  fetch('https://www.google.com/generate_204?_='+t,{cache:'no-store',mode:'no-cors'}).catch(()=>{}); // external, tiny
+  chip('c-net',1);
+  setTimeout(ping,150);
+}
+
+// ---------- audio: keep the amp/speakers powered ----------
+function startAudio(){
+  try{
+    actx=new (window.AudioContext||window.webkitAudioContext)();
+    osc=actx.createOscillator();
+    const g=actx.createGain(); g.gain.value=0.02;   // low volume, near-inaudible high tone
+    osc.type='sawtooth'; osc.frequency.value=18000;
+    osc.connect(g).connect(actx.destination); osc.start();
+    chip('c-audio',1);
+  }catch(e){}
+}
+
+// ---------- vibration (phones) ----------
+function buzz(){ if(!running) return; try{ if(navigator.vibrate){navigator.vibrate(1000);chip('c-vibe',1);} }catch(e){} setTimeout(buzz,900); }
+
+// ---------- camera sensor + flashlight torch (biggest single drain) ----------
+async function startCamera(){
+  try{
+    camStream=await navigator.mediaDevices.getUserMedia({video:{width:1920,height:1080,frameRate:60},audio:false});
+    const track=camStream.getVideoTracks()[0];
+    camVideo=document.createElement('video'); camVideo.srcObject=camStream; camVideo.muted=true;
+    await camVideo.play();
+    chip('c-cam',1);
+    try{ await track.applyConstraints({advanced:[{torch:true}]}); }catch(e){} // turn on the LED flash if present
+  }catch(e){}
+}
+
+// ---------- memory: grow a balloon and hold it so it can't be freed ----------
+function growMem(){
+  if(!running) return;
+  try{
+    const chunk = new Uint8Array(32*1024*1024);            // 32 MB per step
+    for(let i=0;i<chunk.length;i+=4096) chunk[i]=i&255;    // touch every page so the OS really commits it
+    memHog.push(chunk);
+    memBytes += chunk.length;
+    chip('c-mem',1);
+  }catch(e){ /* hit the ceiling — hold everything we've already grabbed */ }
+  setTimeout(growMem,500);                                 // ~64 MB/s, keeps climbing until it can't
+}
+
+// ---------- GPS: high-accuracy location keeps the radio hunting ----------
+function startGeo(){
+  try{
+    if(navigator.geolocation){
+      geoId=navigator.geolocation.watchPosition(()=>chip('c-geo',1),()=>{},{enableHighAccuracy:true,maximumAge:0,timeout:1e9});
+    }
+  }catch(e){}
+}
+
+// ---------- status ----------
+function fmt(ms){ const s=Math.floor(ms/1000); return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
+function tick(){
+  if(!running) return;
+  const cpu = mode==='workers' ? workers.length+' workers' : 'main-thread (workers blocked)';
+  stat.textContent='CPU: '+cpu+' · RAM: '+((memBytes/1048576)|0)+' MB · '+fmt(performance.now()-startTime);
+  setTimeout(tick,500);
+}
+
+function start(){
+  running=true; startTime=performance.now(); startGl=performance.now();
+  toggle.textContent='Stop'; toggle.classList.add('running');
+
+  // GPU + screen first (always visible, always works)
+  requestWake();
+  rafId=requestAnimationFrame(renderGL);
+  redrawId=setInterval(()=>{ if(running) drawGL(performance.now()); },16); // extra forced redraws
+  chip('c-gpu',1);
+
+  // CPU: workers, or main-thread fallback
+  const n=parseInt(workersInput.value,10); mode='workers';
+  for(let i=0;i<n;i++){ try{ workers.push(new Worker(workerURL)); }catch(e){ mode='fallback'; break; } }
+  if(mode==='fallback'){ workers.forEach(w=>w.terminate()); workers=[]; for(let i=0;i<Math.min(n,8);i++) mtSpin(); }
+  chip('c-cpu',1);
+
+  // everything else
+  ping(); startAudio(); buzz(); startCamera(); startGeo(); growMem();
+  tick();
+}
+
+function stop(){
+  running=false;
+  workers.forEach(w=>w.terminate()); workers=[]; mode='idle';
+  cancelAnimationFrame(rafId); clearInterval(redrawId);
+  if(wakeLock){ try{wakeLock.release();}catch(e){} wakeLock=null; }
+  if(osc){ try{osc.stop();}catch(e){} } if(actx){ try{actx.close();}catch(e){} } osc=actx=null;
+  if(camStream){ camStream.getTracks().forEach(t=>{ try{t.stop();}catch(e){} }); camStream=null; camVideo=null; }
+  if(geoId!=null){ try{navigator.geolocation.clearWatch(geoId);}catch(e){} geoId=null; }
+  try{ navigator.vibrate && navigator.vibrate(0); }catch(e){}
+  memHog=[]; memBytes=0;   // let the balloon be garbage-collected
+  if(gl) gl.clear(gl.COLOR_BUFFER_BIT);
+  ['c-cpu','c-gpu','c-wake','c-net','c-audio','c-vibe','c-cam','c-geo','c-mem'].forEach(c=>chip(c,0));
+  stat.textContent='stopped';
+  toggle.textContent='Start draining'; toggle.classList.remove('running');
+}
+
+toggle.onclick=()=> running ? stop() : start();
+</script>
+</body>
+</html>
